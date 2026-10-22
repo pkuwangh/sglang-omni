@@ -2,13 +2,85 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+from importlib.util import find_spec
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+from sglang_omni.models.qwen3_tts.compat import (
+    apply_qwen_tts_transformers_compatibility_patches,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.utils import snake_beta
+from sglang_omni.utils.channels_last_conv import channels_last_weight
+
+if find_spec("cutlass") is not None and find_spec("qwen_tts") is not None:
+    from sglang_omni.models.qwen3_tts.cutedsl.vocoder import (
+        CuTeDSLCausalConv1d,
+        CuTeDSLResidualUnit,
+    )
+    from sglang_omni.models.qwen3_tts.incremental_codec import (
+        Qwen3TTSIncrementalCodecState,
+        incremental_causal_conv1d,
+    )
+else:
+    CuTeDSLResidualUnit = None
+
+if find_spec("cutlass") is not None:
+    from sglang_omni.models.qwen3_tts.cutedsl.conv1d import (
+        compile_kernel,
+        conv1d,
+        pointwise_conv,
+    )
+    from sglang_omni.models.qwen3_tts.cutedsl.snake_beta import fuse_cutedsl_vocoder
+else:
+    fuse_cutedsl_vocoder = None
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or fuse_cutedsl_vocoder is None,
+    reason="requires CUDA and CUTLASS DSL",
+)
+@pytest.mark.parametrize(
+    "channels_last,length", [(False, 33), (True, 33), (False, 65536), (True, 65536)]
+)
+@torch.inference_mode()
+def test_cutedsl_snake_preserves_checkpoint_and_graph_replay(
+    channels_last: bool, length: int
+) -> None:
+    """Prepared coefficients preserve checkpoint keys, eager rounding, and compiled graph replay."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires Hopper or datacenter Blackwell")
+    torch.manual_seed(42)
+    original = StubSnakeBeta(64).to(device="cuda", dtype=torch.bfloat16).eval()
+    decoder = torch.nn.Sequential(original)
+    checkpoint = {name: value.clone() for name, value in decoder.state_dict().items()}
+    assert fuse_cutedsl_vocoder(decoder) == 1
+    assert fuse_cutedsl_vocoder(decoder) == 0
+    assert decoder.state_dict().keys() == checkpoint.keys()
+    assert all(
+        torch.equal(value, checkpoint[name])
+        for name, value in decoder.state_dict().items()
+    )
+    x = torch.randn(1, 64, length, device="cuda", dtype=torch.bfloat16)
+    if channels_last:
+        x = x.transpose(1, 2).contiguous().transpose(1, 2)
+    compiled = torch.compile(decoder, fullgraph=True)
+    torch.testing.assert_close(compiled(x), original(x), atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = decoder(x)
+    x.normal_()
+    graph.replay()
+    assert actual.stride() == x.stride()
+    torch.testing.assert_close(actual, original(x), atol=0, rtol=0)
+    resized = torch.randn(2, 64, length + 8, device="cuda", dtype=torch.bfloat16)
+    if channels_last:
+        resized = resized.transpose(1, 2).contiguous().transpose(1, 2)
+    torch.testing.assert_close(decoder(resized), original(resized), atol=0, rtol=0)
 
 
 class StubSnakeBeta(torch.nn.Module):
@@ -29,6 +101,223 @@ class StubSnakeBeta(torch.nn.Module):
 
 
 StubSnakeBeta.__name__ = "SnakeBeta"
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or fuse_cutedsl_vocoder is None,
+    reason="requires CUDA and CUTLASS DSL",
+)
+@torch.inference_mode()
+def test_cutedsl_snake_large_offsets() -> None:
+    """Buffers above 2**31 elements must not overflow launch dimensions or element offsets."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires Hopper or datacenter Blackwell")
+    else:
+        pass
+    if torch.cuda.mem_get_info()[0] < 12 * 1024**3:
+        pytest.skip("Large-offset regression needs 12 GiB free device memory")
+    else:
+        pass
+    torch.manual_seed(42)
+    original = StubSnakeBeta(96).to(device="cuda", dtype=torch.bfloat16).eval()
+    decoder = torch.nn.Sequential(original)
+    assert fuse_cutedsl_vocoder(decoder) == 1
+    hidden_states = torch.ones(32, 96, 699056, device="cuda", dtype=torch.bfloat16)
+    actual = decoder(hidden_states)
+    expected = original(hidden_states[:, :, :8])
+    torch.testing.assert_close(actual[:, :, :8], expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual[:, :, -8:], expected, atol=0, rtol=0)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or CuTeDSLResidualUnit is None,
+    reason="requires CUDA, CUTLASS DSL, and qwen-tts",
+)
+@pytest.mark.parametrize("channels,dilation", [(96, 3), (192, 9), (768, 1)])
+@torch.inference_mode()
+def test_cutedsl_residual_graph_and_incremental_cache(
+    channels: int, dilation: int
+) -> None:
+    """Fusion preserves checkpoint keys, causal history, and graph replay across audio lengths."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires Hopper or datacenter Blackwell")
+    else:
+        pass
+    torch.manual_seed(42)
+    apply_qwen_tts_transformers_compatibility_patches()
+    tokenizer = import_module(
+        "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2"
+    )
+    original = (
+        tokenizer.Qwen3TTSTokenizerV2DecoderDecoderResidualUnit(channels, dilation)
+        .cuda()
+        .bfloat16()
+        .eval()
+    )
+    assert fuse_cutedsl_vocoder(original) == 2
+    fused = CuTeDSLResidualUnit(original).eval()
+    assert fused.state_dict().keys() == original.state_dict().keys()
+    assert all(
+        torch.equal(value, original.state_dict()[name])
+        for name, value in fused.state_dict().items()
+    )
+    for batch_size, length in ((1, 65), (2, 257)):
+        hidden_states = torch.randn(
+            batch_size, channels, length, device="cuda", dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(
+            fused(hidden_states), original(hidden_states), atol=0.03125, rtol=0.02
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = fused(hidden_states)
+        hidden_states.normal_()
+        graph.replay()
+        torch.testing.assert_close(output, fused(hidden_states), atol=0, rtol=0)
+        original_state = Qwen3TTSIncrementalCodecState()
+        fused_state = Qwen3TTSIncrementalCodecState()
+        for chunk in hidden_states.split(32, dim=-1):
+            expected = incremental_causal_conv1d(
+                original.conv1, chunk, original_state, "conv"
+            )
+            actual = incremental_causal_conv1d(fused.conv1, chunk, fused_state, "conv")
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            fused_state.conv_histories["conv"],
+            original_state.conv_histories["conv"],
+            atol=0,
+            rtol=0,
+        )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or fuse_cutedsl_vocoder is None,
+    reason="requires CUDA and CUTLASS DSL",
+)
+@torch.inference_mode()
+def test_cutedsl_input_convolution_causal_boundaries() -> None:
+    """Channel expansion and partial temporal tiles preserve left-zero causal padding."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires Hopper or datacenter Blackwell")
+    else:
+        pass
+    torch.manual_seed(42)
+    weight = (
+        torch.randn(1536, 7, 1024, device="cuda", dtype=torch.bfloat16)
+        / (7 * 1024) ** 0.5
+    )
+    bias = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+    for batch_size, length in ((1, 1), (2, 129)):
+        hidden_states = torch.randn(
+            batch_size, length, 1024, device="cuda", dtype=torch.bfloat16
+        )
+        expected = torch.nn.functional.conv1d(
+            torch.nn.functional.pad(hidden_states.transpose(1, 2).contiguous(), (6, 0)),
+            weight.transpose(1, 2).contiguous(),
+            bias,
+        ).transpose(1, 2)
+        torch.testing.assert_close(
+            conv1d(hidden_states, weight, bias, 1), expected, atol=0.03125, rtol=0.02
+        )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or CuTeDSLResidualUnit is None,
+    reason="requires CUDA, CUTLASS DSL, and qwen-tts",
+)
+@torch.inference_mode()
+def test_cutedsl_output_convolution_compiled_fallback() -> None:
+    """The one-channel vocoder fallback passes both bias and length to the convolution helper."""
+    torch.manual_seed(42)
+    apply_qwen_tts_transformers_compatibility_patches()
+    tokenizer = import_module(
+        "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2"
+    )
+    original = (
+        tokenizer.Qwen3TTSTokenizerV2CausalConvNet(96, 1, 7).cuda().bfloat16().eval()
+    )
+    wrapped = CuTeDSLCausalConv1d(original)
+    hidden_states = torch.randn(1, 96, 65, device="cuda", dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        wrapped(hidden_states), original(hidden_states), atol=0.03125, rtol=0.02
+    )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or fuse_cutedsl_vocoder is None,
+    reason="requires CUDA and CUTLASS DSL",
+)
+@torch.inference_mode()
+def test_cutedsl_convolution_dynamic_sizes() -> None:
+    """Changing batch and length reuses full/partial-tile binaries with correct boundaries."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires Hopper or datacenter Blackwell")
+    else:
+        pass
+    torch.manual_seed(42)
+    weight = (
+        torch.randn(96, 7, 96, device="cuda", dtype=torch.bfloat16) / (7 * 96) ** 0.5
+    )
+    compile_kernel.cache_clear()
+    for batch_size, length in ((1, 1), (2, 65), (3, 257), (1, 33), (2, 128), (1, 384)):
+        hidden_states = torch.randn(
+            batch_size, length, 96, device="cuda", dtype=weight.dtype
+        )
+        expected = torch.nn.functional.conv1d(
+            torch.nn.functional.pad(
+                hidden_states.transpose(1, 2).contiguous(), (18, 0)
+            ),
+            weight.transpose(1, 2).contiguous(),
+            dilation=3,
+        ).transpose(1, 2)
+        torch.testing.assert_close(
+            conv1d(hidden_states, weight, None, 3), expected, atol=0.03125, rtol=0.02
+        )
+    assert compile_kernel.cache_info().misses == 2
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or CuTeDSLResidualUnit is None,
+    reason="requires CUDA, CUTLASS DSL, and qwen-tts",
+)
+@pytest.mark.parametrize("channels", [96, 768])
+@torch.inference_mode()
+def test_cutedsl_incremental_pointwise_preserves_outputs_and_replay(
+    channels: int,
+) -> None:
+    """The streaming pointwise convolution leaves bias and residual to its consumer, including graph replay."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires Hopper or datacenter Blackwell")
+    else:
+        pass
+    torch.manual_seed(42)
+    module = torch.nn.Conv1d(channels, channels, 1).cuda().bfloat16().eval()
+    weight = channels_last_weight(module).transpose(1, 2)
+    for length in (1, 32, 7):
+        hidden_states = torch.randn(
+            2, length, channels, device="cuda", dtype=torch.bfloat16
+        )
+        expected = torch.nn.functional.conv1d(
+            hidden_states.transpose(1, 2), module.weight
+        ).transpose(1, 2)
+        actual = pointwise_conv(hidden_states, weight, None, None)
+        torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.02)
+
+    compiled = torch.compile(pointwise_conv, fullgraph=True)
+    compiled(hidden_states, weight, None, None)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(hidden_states, weight, None, None)
+    hidden_states.normal_()
+    graph.replay()
+    expected = pointwise_conv(hidden_states, weight, None, None)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_fuse_vocoder_decoder_keeps_originals_on_prewarm_failure(
