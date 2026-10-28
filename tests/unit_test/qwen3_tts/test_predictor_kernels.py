@@ -57,7 +57,9 @@ def rounded_rmsnorm(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 )
 @pytest.mark.parametrize("hidden_size,batch_size", [(1024, 1), (1024, 16), (2048, 17)])
 @torch.inference_mode()
-def test_cutedsl_talker_decode_cache(hidden_size: int, batch_size: int) -> None:
+def test_cutedsl_talker_decode_cache(
+    hidden_size: int, batch_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Fused talker decode must read and update engine-owned cache slots like the default loop."""
     if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
         pytest.skip("requires Hopper or datacenter Blackwell")
@@ -106,6 +108,15 @@ def test_cutedsl_talker_decode_cache(hidden_size: int, batch_size: int) -> None:
                 parameter.fill_(1)
             else:
                 parameter.normal_(std=parameter.shape[-1] ** -0.5)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                torch.cuda,
+                "get_device_properties",
+                lambda device: SimpleNamespace(
+                    major=9, minor=0, multi_processor_count=78
+                ),
+            )
+            assert build_cutedsl_layers(model.layers) is None
         fused_layers = build_cutedsl_layers(model.layers)
         assert fused_layers is not None
         model.cutedsl_layers = None

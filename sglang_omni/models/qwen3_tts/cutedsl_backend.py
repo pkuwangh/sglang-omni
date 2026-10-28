@@ -22,6 +22,9 @@ from sglang_omni.models.qwen3_tts.cutedsl.runtime import (
 
 logger = logging.getLogger(__name__)
 
+# note (Hao Wang): Wide CTAs use over half of Hopper SMEM, so 96 resident CTAs need at least 96 SMs.
+MIN_DECODE_SM_COUNT = 96
+
 
 class CuTeDSLDecoderLayer(nn.Module):
     """Pack loaded weights without changing the engine's attention or cache ownership."""
@@ -62,6 +65,8 @@ def build_cutedsl_layers(layers: nn.ModuleList) -> nn.ModuleList | None:
             or weight.dtype != torch.bfloat16
             or torch.cuda.get_device_capability(weight.device)
             not in ((9, 0), (10, 0), (10, 3))
+            or torch.cuda.get_device_properties(weight.device).multi_processor_count
+            < MIN_DECODE_SM_COUNT
             or hidden_size not in (1024, 2048)
             or (attention.num_heads, attention.num_kv_heads, attention.head_dim)
             != (QUERY_HEADS, KV_HEADS, HEAD_DIM)
