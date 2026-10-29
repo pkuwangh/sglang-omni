@@ -38,7 +38,10 @@ if find_spec("cutlass") is not None:
         compile_post_attention,
         compile_pre_attention,
     )
-    from sglang_omni.models.qwen3_tts.cutedsl_backend import build_cutedsl_layers
+    from sglang_omni.models.qwen3_tts.cutedsl_backend import (
+        MIN_DECODE_SM_COUNT,
+        build_cutedsl_layers,
+    )
 else:
     PackedPostAttention = SlotPreAttention = None
 
@@ -61,8 +64,12 @@ def test_cutedsl_talker_decode_cache(
     hidden_size: int, batch_size: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Fused talker decode must read and update engine-owned cache slots like the default loop."""
-    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
-        pytest.skip("requires Hopper or datacenter Blackwell")
+    if (
+        torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3))
+        or torch.cuda.get_device_properties("cuda").multi_processor_count
+        < MIN_DECODE_SM_COUNT
+    ):
+        pytest.skip("requires Hopper or datacenter Blackwell with at least 96 SMs")
     else:
         pass
     torch.manual_seed(42)
@@ -253,8 +260,12 @@ def check_cutedsl_cache_slots_and_workspace_replay(
     hidden_size: int, batch_size: int, rope_positions: int
 ) -> None:
     """Check cache writes and post-attention outputs against rounded BF16 operations."""
-    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
-        pytest.skip("requires Hopper or datacenter Blackwell")
+    if (
+        torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3))
+        or torch.cuda.get_device_properties("cuda").multi_processor_count
+        < MIN_DECODE_SM_COUNT
+    ):
+        pytest.skip("requires Hopper or datacenter Blackwell with at least 96 SMs")
     else:
         pass
     torch.manual_seed(42)

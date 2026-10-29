@@ -52,7 +52,10 @@ if find_spec("cutlass") is not None:
         sample_logits,
         sample_sorted,
     )
-    from sglang_omni.models.qwen3_tts.cutedsl_backend import CuTeDSLDecoderLayer
+    from sglang_omni.models.qwen3_tts.cutedsl_backend import (
+        MIN_DECODE_SM_COUNT,
+        CuTeDSLDecoderLayer,
+    )
 else:
     argmax_embedding = None
 
@@ -2309,8 +2312,12 @@ def relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
 @torch.inference_mode()
 def test_cutedsl_pair_matches_serial_decode_and_graph_replay(batch_size: int) -> None:
     """The two-token prefix preserves causal attention, token order, and cache slots on replay."""
-    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
-        pytest.skip("requires Hopper or datacenter Blackwell")
+    if (
+        torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3))
+        or torch.cuda.get_device_properties("cuda").multi_processor_count
+        < MIN_DECODE_SM_COUNT
+    ):
+        pytest.skip("requires Hopper or datacenter Blackwell with at least 96 SMs")
     else:
         pass
     torch.manual_seed(42)

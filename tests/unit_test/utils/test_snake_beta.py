@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from importlib import import_module
 from importlib.util import find_spec
 from unittest.mock import Mock
@@ -18,8 +19,10 @@ from sglang_omni.utils.channels_last_conv import channels_last_weight
 
 if find_spec("cutlass") is not None and find_spec("qwen_tts") is not None:
     from sglang_omni.models.qwen3_tts.cutedsl.vocoder import (
+        ChannelsLastUpsample,
         CuTeDSLCausalConv1d,
         CuTeDSLResidualUnit,
+        fuse_cutedsl_convolutions,
     )
     from sglang_omni.models.qwen3_tts.incremental_codec import (
         Qwen3TTSIncrementalCodecState,
@@ -37,6 +40,85 @@ if find_spec("cutlass") is not None:
     from sglang_omni.models.qwen3_tts.cutedsl.snake_beta import fuse_cutedsl_vocoder
 else:
     fuse_cutedsl_vocoder = None
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or CuTeDSLResidualUnit is None,
+    reason="requires CUDA, CUTLASS DSL, and qwen-tts",
+)
+@pytest.mark.parametrize("windowed", [False, True])
+@torch.inference_mode()
+def test_cutedsl_decoder_replacement_and_graph_replay(windowed: bool) -> None:
+    """Replacing decoder blocks preserves waveform alignment in full/window decode and graph replay."""
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
+        pytest.skip("requires Hopper or datacenter Blackwell")
+    else:
+        pass
+    torch.manual_seed(42)
+    apply_qwen_tts_transformers_compatibility_patches()
+    tokenizer = import_module(
+        "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2"
+    )
+    configuration = tokenizer.Qwen3TTSTokenizerV2DecoderConfig(
+        hidden_size=64,
+        latent_dim=64,
+        codebook_dim=64,
+        codebook_size=32,
+        num_quantizers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=16,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        max_position_embeddings=64,
+        decoder_dim=512,
+        attn_implementation="sdpa",
+    )
+    original = (
+        tokenizer.Qwen3TTSTokenizerV2Decoder(configuration).cuda().bfloat16().eval()
+    )
+    for name, parameter in original.named_parameters():
+        if name.endswith("embedding_sum"):
+            parameter.normal_()
+        else:
+            pass
+    fused = copy.deepcopy(original)
+    assert fuse_cutedsl_vocoder(fused) > 0
+    assert fuse_cutedsl_convolutions(fused) > 0
+    assert all(
+        isinstance(block.block[1], ChannelsLastUpsample)
+        for block in fused.decoder[1:-2]
+    )
+    if windowed:
+        reference_decode = original.chunked_decode
+        fused_decode = fused.chunked_decode
+        decode_arguments = {"chunk_size": 3, "left_context_size": 2}
+    else:
+        reference_decode = original
+        fused_decode = fused
+        decode_arguments = {}
+    codes = torch.randint(32, (2, 2, 7), device="cuda")
+    # note (Hao Wang): Random decoder weights produce quiet audio, so scale tolerance to waveform RMS.
+    expected = reference_decode(codes, **decode_arguments)
+    absolute_tolerance = 0.04 * expected.float().square().mean().sqrt().item()
+    torch.testing.assert_close(
+        fused_decode(codes, **decode_arguments),
+        expected,
+        atol=absolute_tolerance,
+        rtol=0.02,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        waveform = fused_decode(codes, **decode_arguments)
+    for _ in range(2):
+        codes.random_(0, 32)
+        graph.replay()
+        expected = reference_decode(codes, **decode_arguments)
+        absolute_tolerance = 0.04 * expected.float().square().mean().sqrt().item()
+        torch.testing.assert_close(
+            waveform, expected, atol=absolute_tolerance, rtol=0.02
+        )
 
 
 @pytest.mark.accelerator
